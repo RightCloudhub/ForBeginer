@@ -1,12 +1,4 @@
-flask==2.0.1
-flask-cors==3.0.10
-python-dotenv==0.19.0
-pylint==2.9.6
-pycodestyle==2.7.0
-pydocstyle==6.1.1
-pyflakes==2.3.1
-py-spy==0.3.8
-pycparser==2.20
-colorama==0.4.4
-watchdog==2.1.5
-astor==0.8.1
+Flask>=3.0,<4.0
+flask-cors>=4.0,<5.0
+python-dotenv>=1.0,<2.0
+gunicorn>=22.0,<24.0 ; platform_system != "Windows"

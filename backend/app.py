@@ -1,980 +1,1054 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+from __future__ import annotations
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import subprocess
-import tempfile
+import ast
+import json
+import logging
+import math
 import os
-import json
+import re
+import shutil
 import sys
-import traceback
+import tempfile
+import textwrap
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-app = Flask(__name__)
-CORS(app)
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 
-@app.route('/')
-def index():
-    return jsonify({"status": "API is running"})
+if __package__:
+    from .execution import ProcessResult, run_process
+else:
+    from execution import ProcessResult, run_process
 
-@app.route('/analyze', methods=['POST'])
-def analyze_code():
-    data = request.json
-    code = data.get('code', '')
-    language = data.get('language', 'python')
-    
-    if not code:
-        return jsonify({"error": "No code provided"}), 400
-    
-    try:
-        if language.lower() == 'python':
-            result = analyze_python_code(code)
-        elif language.lower() == 'c':
-            result = analyze_c_code(code)
-        else:
-            return jsonify({"error": "Unsupported language"}), 400
-        
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional in local development
+    load_dotenv = None
 
-def analyze_python_code(code):
-    # 创建临时文件来存储代码和分析结果
-    with tempfile.NamedTemporaryFile(suffix='.py', delete=False) as temp_file:
-        temp_file.write(code.encode('utf-8'))
-        temp_file_path = temp_file.name
-    
-    # 创建一个修改版本的代码，添加跟踪语句
-    instrumented_code = instrument_python_code(code)
-    with tempfile.NamedTemporaryFile(suffix='.py', delete=False) as instrumented_file:
-        instrumented_file.write(instrumented_code.encode('utf-8'))
-        instrumented_file_path = instrumented_file.name
-    
-    try:
-        # 运行修改后的代码来收集执行信息
-        result = subprocess.run(
-            [sys.executable, instrumented_file_path],
-            capture_output=True,
-            text=True,
-            timeout=5  # 设置超时，防止无限循环
-        )
-        
-        # 解析输出以获取执行跟踪
-        execution_trace = parse_python_execution_trace(result.stdout)
-        
-        # 进行静态分析以获取代码结构
-        code_structure = analyze_python_structure(code)
-        
-        return {
-            "status": "success",
-            "execution_trace": execution_trace,
-            "code_structure": code_structure,
-            "stdout": result.stdout,
-            "stderr": result.stderr
+
+if load_dotenv is not None:
+    load_dotenv()
+
+
+LOGGER = logging.getLogger(__name__)
+TRACE_PREFIX = "__TRACE__:"
+SUPPORTED_LANGUAGES = {"python", "c"}
+FUNCTION_PATTERN = re.compile(
+    r"^\s*([A-Za-z_][\w\s\*]*?)\s+([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*\{"
+)
+STRUCT_PATTERN = re.compile(r"^\s*struct\s+([A-Za-z_]\w*)\s*\{")
+VARIABLE_PATTERN = re.compile(
+    r"^\s*([A-Za-z_][\w\s\*]*?)\s+([A-Za-z_]\w*)\s*=\s*.+;\s*$"
+)
+
+PYTHON_TRACE_BOOTSTRAP = textwrap.dedent(
+    """
+    import json
+    import pathlib
+    import sys
+    import traceback
+
+    TRACE_PREFIX = "__TRACE__:"
+    MAX_TRACE_STEPS = int(sys.argv[2])
+    trace_count = 0
+    trace_limit_reached = False
+    call_stack = []
+    target_path = pathlib.Path(sys.argv[1]).resolve()
+
+    def safe_repr(value):
+        try:
+            rendered = repr(value)
+        except Exception:
+            rendered = f"<unrepresentable {type(value).__name__}>"
+
+        if len(rendered) > 160:
+            rendered = rendered[:157] + "..."
+        return rendered
+
+    def normalize_locals(frame_locals):
+        variables = {}
+        for name, value in frame_locals.items():
+            if name.startswith("__"):
+                continue
+            if callable(value):
+                continue
+            variables[name] = safe_repr(value)
+            if len(variables) >= 64:
+                break
+        return variables
+
+    def tracer(frame, event, arg):
+        global trace_count, trace_limit_reached
+
+        try:
+            frame_path = pathlib.Path(frame.f_code.co_filename).resolve()
+        except Exception:
+            return tracer
+
+        if frame_path != target_path:
+            return tracer
+
+        if event == "call":
+            call_stack.append({"name": frame.f_code.co_name, "line": frame.f_lineno})
+            return tracer
+
+        if event == "return":
+            if call_stack and call_stack[-1]["name"] == frame.f_code.co_name:
+                call_stack.pop()
+            return tracer
+
+        if event != "line":
+            return tracer
+
+        if trace_count >= MAX_TRACE_STEPS:
+            if not trace_limit_reached:
+                trace_limit_reached = True
+                print(
+                    TRACE_PREFIX
+                    + json.dumps({"event": "trace_limit_reached", "limit": MAX_TRACE_STEPS}),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return None
+
+        trace_count += 1
+        if call_stack:
+            call_stack[-1]["line"] = frame.f_lineno
+        entry = {
+            "line": frame.f_lineno,
+            "function": frame.f_code.co_name,
+            "variables": normalize_locals(frame.f_locals),
+            "call_stack": list(call_stack),
         }
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "error": "Code execution timed out"}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-    finally:
-        # 清理临时文件
+        print(TRACE_PREFIX + json.dumps(entry, ensure_ascii=False), file=sys.stderr, flush=True)
+        return tracer
+
+    def main():
+        code_path = target_path
+        with code_path.open("r", encoding="utf-8") as handle:
+            source = handle.read()
+
+        globals_dict = {
+            "__name__": "__main__",
+            "__file__": str(code_path),
+            "__package__": None,
+        }
+
+        sys.settrace(tracer)
         try:
-            os.unlink(temp_file_path)
-            os.unlink(instrumented_file_path)
-        except:
-            pass
-
-def instrument_python_code(code):
-    """向Python代码添加跟踪语句，以便跟踪变量和执行流程"""
-    import ast
-    import astor
-    
-    # 尝试使用AST进行代码插桩
-    try:
-        # 解析代码为AST
-        tree = ast.parse(code)
-        
-        # 定义跟踪函数和初始化代码
-        trace_setup = """
-import sys
-import json
-import traceback
-
-_trace_data = []
-_call_stack = []
-
-def _trace_line(line_no, locals_dict, call_depth=0):
-    # 过滤掉内部变量
-    filtered_locals = {}
-    for k, v in locals_dict.items():
-        if k.startswith('_') and k != '_call_stack':
-            continue
-        if k == 'locals_dict':
-            continue
-            
-        # 处理不同类型的变量
-        try:
-            if isinstance(v, (int, float, bool, str, type(None))):
-                filtered_locals[k] = repr(v)
-            elif isinstance(v, (list, tuple)):
-                if len(v) > 5:
-                    filtered_locals[k] = f"{type(v).__name__}([{', '.join(repr(x) for x in v[:5])}...], len={len(v)})"
-                else:
-                    filtered_locals[k] = f"{type(v).__name__}({repr(v)})"
-            elif isinstance(v, dict):
-                if len(v) > 3:
-                    items = list(v.items())[:3]
-                    filtered_locals[k] = f"dict({{{', '.join(f'{repr(k)}: {repr(v)}' for k, v in items)}...}}, len={len(v)})"
-                else:
-                    filtered_locals[k] = f"dict({repr(v)})"
-            else:
-                filtered_locals[k] = f"{type(v).__name__}({repr(v)})"
-        except:
-            filtered_locals[k] = f"{type(v).__name__}(...)"
-    
-    # 创建跟踪数据
-    trace_entry = {
-        'line': line_no,
-        'variables': filtered_locals,
-        'call_stack': list(_call_stack)
-    }
-    _trace_data.append(trace_entry)
-    
-    # 输出跟踪数据
-    print(f'TRACE:{json.dumps(trace_entry)}')
-
-def _trace_call(func_name, line_no):
-    _call_stack.append({'name': func_name, 'line': line_no})
-    
-def _trace_return(func_name):
-    if _call_stack and _call_stack[-1]['name'] == func_name:
-        _call_stack.pop()
-"""
-        
-        # 创建包含跟踪设置的模块
-        setup_ast = ast.parse(trace_setup)
-        
-        # 定义AST转换器来添加跟踪调用
-        class TraceTransformer(ast.NodeTransformer):
-            def __init__(self):
-                self.function_stack = []
-            
-            def visit_Module(self, node):
-                # 添加跟踪设置到模块开头
-                node.body = setup_ast.body + node.body
-                return self.generic_visit(node)
-            
-            def visit_FunctionDef(self, node):
-                # 记录当前函数
-                self.function_stack.append(node.name)
-                
-                # 添加函数调用跟踪
-                trace_call = ast.Expr(
-                    value=ast.Call(
-                        func=ast.Name(id='_trace_call', ctx=ast.Load()),
-                        args=[
-                            ast.Constant(value=node.name),
-                            ast.Constant(value=node.lineno)
-                        ],
-                        keywords=[]
-                    )
-                )
-                
-                # 添加函数返回跟踪到每个return语句
-                new_body = []
-                for item in node.body:
-                    if isinstance(item, ast.Return):
-                        trace_return = ast.Expr(
-                            value=ast.Call(
-                                func=ast.Name(id='_trace_return', ctx=ast.Load()),
-                                args=[ast.Constant(value=node.name)],
-                                keywords=[]
-                            )
-                        )
-                        new_body.append(trace_return)
-                    new_body.append(item)
-                
-                # 更新函数体
-                node.body = [trace_call] + new_body
-                
-                # 继续处理函数体
-                self.generic_visit(node)
-                
-                # 离开函数
-                self.function_stack.pop()
-                return node
-            
-            def visit_Assign(self, node):
-                # 在赋值后添加跟踪
-                self.generic_visit(node)
-                trace_expr = ast.Expr(
-                    value=ast.Call(
-                        func=ast.Name(id='_trace_line', ctx=ast.Load()),
-                        args=[
-                            ast.Constant(value=node.lineno),
-                            ast.Call(
-                                func=ast.Name(id='locals', ctx=ast.Load()),
-                                args=[],
-                                keywords=[]
-                            ),
-                            ast.Constant(value=len(self.function_stack))
-                        ],
-                        keywords=[]
-                    )
-                )
-                return [node, trace_expr]
-            
-            def visit_If(self, node):
-                # 在if语句后添加跟踪
-                self.generic_visit(node)
-                trace_expr = ast.Expr(
-                    value=ast.Call(
-                        func=ast.Name(id='_trace_line', ctx=ast.Load()),
-                        args=[
-                            ast.Constant(value=node.lineno),
-                            ast.Call(
-                                func=ast.Name(id='locals', ctx=ast.Load()),
-                                args=[],
-                                keywords=[]
-                            ),
-                            ast.Constant(value=len(self.function_stack))
-                        ],
-                        keywords=[]
-                    )
-                )
-                return [node, trace_expr]
-            
-            def visit_For(self, node):
-                # 在for循环后添加跟踪
-                self.generic_visit(node)
-                trace_expr = ast.Expr(
-                    value=ast.Call(
-                        func=ast.Name(id='_trace_line', ctx=ast.Load()),
-                        args=[
-                            ast.Constant(value=node.lineno),
-                            ast.Call(
-                                func=ast.Name(id='locals', ctx=ast.Load()),
-                                args=[],
-                                keywords=[]
-                            ),
-                            ast.Constant(value=len(self.function_stack))
-                        ],
-                        keywords=[]
-                    )
-                )
-                return [node, trace_expr]
-            
-            def visit_While(self, node):
-                # 在while循环后添加跟踪
-                self.generic_visit(node)
-                trace_expr = ast.Expr(
-                    value=ast.Call(
-                        func=ast.Name(id='_trace_line', ctx=ast.Load()),
-                        args=[
-                            ast.Constant(value=node.lineno),
-                            ast.Call(
-                                func=ast.Name(id='locals', ctx=ast.Load()),
-                                args=[],
-                                keywords=[]
-                            ),
-                            ast.Constant(value=len(self.function_stack))
-                        ],
-                        keywords=[]
-                    )
-                )
-                return [node, trace_expr]
-        
-        # 应用转换器
-        transformer = TraceTransformer()
-        transformed_tree = transformer.visit(tree)
-        
-        # 添加最终跟踪数据输出
-        final_print = ast.Expr(
-            value=ast.Call(
-                func=ast.Name(id='print', ctx=ast.Load()),
-                args=[ast.Constant(value='TRACE_END')],
-                keywords=[]
+            exec(compile(source, str(code_path), "exec"), globals_dict, globals_dict)
+        finally:
+            sys.settrace(None)
+            print(
+                TRACE_PREFIX + json.dumps(
+                    {"event": "final_state", "variables": normalize_locals(globals_dict)},
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+                flush=True,
             )
+
+    if __name__ == "__main__":
+        try:
+            main()
+        except SystemExit as error:
+            if error.code not in (None, 0):
+                traceback.print_exc()
+            raise
+        except BaseException:
+            traceback.print_exc()
+            sys.exit(1)
+    """
+)
+
+
+@dataclass(slots=True)
+class ApiError(Exception):
+    message: str
+    status_code: int = 400
+    code: str = "bad_request"
+    details: dict[str, Any] | None = None
+
+
+def create_app() -> Flask:
+    app = Flask(__name__)
+    environment = os.getenv("APP_ENV", "development").strip().lower()
+    app.config.update(
+        APP_ENV=environment,
+        HOST=os.getenv("HOST", "127.0.0.1"),
+        PORT=read_number_env("PORT", 5000, 1, 65535),
+        MAX_CODE_LENGTH=read_number_env("MAX_CODE_LENGTH", 20000, 1, 1_000_000),
+        EXECUTION_TIMEOUT_SECONDS=read_number_env(
+            "EXECUTION_TIMEOUT_SECONDS", 5.0, 0.05, 60.0
+        ),
+        MAX_TRACE_STEPS=read_number_env("MAX_TRACE_STEPS", 800, 1, 5000),
+        MAX_MEMORY_MB=read_number_env("MAX_MEMORY_MB", 256, 32, 4096),
+        MAX_OUTPUT_BYTES=read_number_env("MAX_OUTPUT_BYTES", 65536, 1024, 1_048_576),
+        ALLOW_CODE_EXECUTION=read_bool_env(
+            "ALLOW_CODE_EXECUTION", environment in {"development", "testing"}
+        ),
+        C_COMPILER=os.getenv("C_COMPILER", "gcc"),
+        CORS_ORIGINS=parse_origins(os.getenv("CORS_ORIGINS", "http://localhost:3000")),
+    )
+    app.config["MAX_CONTENT_LENGTH"] = app.config["MAX_CODE_LENGTH"] * 12 + 65536
+
+    configure_logging(app)
+    CORS(app, resources={r"/*": {"origins": app.config["CORS_ORIGINS"]}})
+    register_error_handlers(app)
+    register_routes(app)
+    return app
+
+
+def read_number_env(name: str, default: int | float, minimum, maximum) -> int | float:
+    try:
+        value = type(default)(os.getenv(name, str(default)))
+        if math.isfinite(value) and minimum <= value <= maximum:
+            return value
+    except ValueError:
+        pass
+    raise ValueError(f"{name} must be between {minimum} and {maximum}.")
+
+
+def read_bool_env(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name, str(default)).strip().lower()
+    if raw_value in {"true", "1", "yes", "on"}:
+        return True
+    if raw_value in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true or false.")
+
+
+def parse_origins(raw_value: str) -> list[str] | str:
+    value = raw_value.strip()
+    if not value or value == "*":
+        return "*"
+    return [origin.strip() for origin in value.split(",") if origin.strip()]
+
+
+def configure_logging(app: Flask) -> None:
+    level = logging.DEBUG if app.config["APP_ENV"] == "development" else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+def register_error_handlers(app: Flask) -> None:
+    @app.errorhandler(ApiError)
+    def handle_api_error(error: ApiError):
+        payload = {
+            "status": "error",
+            "error": {
+                "code": error.code,
+                "message": error.message,
+            },
+        }
+        if error.details:
+            payload["error"]["details"] = error.details
+        return jsonify(payload), error.status_code
+
+    @app.errorhandler(HTTPException)
+    def handle_http_error(error: HTTPException):
+        response = error.get_response()
+        response.data = json.dumps(
+            {
+                "status": "error",
+                "error": {
+                    "code": error.name.lower().replace(" ", "_"),
+                    "message": error.description,
+                },
+            }
         )
-        transformed_tree.body.append(final_print)
-        
-        # 将AST转换回代码
-        try:
-            # 尝试使用astor库（如果可用）
-            instrumented_code = astor.to_source(transformed_tree)
-        except (ImportError, NameError):
-            # 如果astor不可用，尝试使用ast.unparse（Python 3.9+）
-            if hasattr(ast, 'unparse'):
-                instrumented_code = ast.unparse(transformed_tree)
-            else:
-                # 如果都不可用，回退到简单的行插桩
-                raise ImportError("需要astor库或Python 3.9+")
-        
-        return instrumented_code
-        
-    except (SyntaxError, ImportError) as e:
-        # 如果AST处理失败，回退到简单的行插桩
-        print(f"AST插桩失败，回退到简单插桩: {str(e)}")
-        lines = code.split('\n')
-        instrumented_lines = []
-        
-        # 添加跟踪模块
-        instrumented_lines.append("import sys")
-        instrumented_lines.append("import json")
-        instrumented_lines.append("_trace_data = []")
-        instrumented_lines.append("_call_stack = []")
-        
-        # 添加跟踪函数
-        instrumented_lines.append("def _trace_line(line_no, locals_dict):")  
-        instrumented_lines.append("    filtered_locals = {k: repr(v) for k, v in locals_dict.items() if not k.startswith('_') and k != 'locals_dict'}")
-        instrumented_lines.append("    trace_entry = {'line': line_no, 'variables': filtered_locals, 'call_stack': list(_call_stack)}")
-        instrumented_lines.append("    _trace_data.append(trace_entry)")
-        instrumented_lines.append("    print(f'TRACE:{json.dumps(trace_entry)}')")
-        
-        # 添加函数跟踪函数
-        instrumented_lines.append("def _trace_call(func_name, line_no):")
-        instrumented_lines.append("    _call_stack.append({'name': func_name, 'line': line_no})")
-        
-        instrumented_lines.append("def _trace_return(func_name):")
-        instrumented_lines.append("    if _call_stack and _call_stack[-1]['name'] == func_name:")
-        instrumented_lines.append("        _call_stack.pop()")
-        
-        # 在每行代码后添加跟踪调用
-        for i, line in enumerate(lines):
-            instrumented_lines.append(line)
-            # 跳过空行和注释行
-            if line.strip() and not line.strip().startswith('#'):
-                # 检测函数定义
-                if line.strip().startswith('def ') and '(' in line and ')' in line:
-                    func_name = line.strip()[4:].split('(')[0]
-                    indent = len(line) - len(line.lstrip())
-                    trace_call = ' ' * indent + f"_trace_call('{func_name}', {i+1})"
-                    instrumented_lines.append(trace_call)
-                # 检测返回语句
-                elif line.strip().startswith('return '):
-                    indent = len(line) - len(line.lstrip())
-                    # 尝试找出当前函数名（简化版）
-                    func_name = "unknown"
-                    for j in range(i, -1, -1):
-                        if lines[j].strip().startswith('def '):
-                            func_name = lines[j].strip()[4:].split('(')[0]
-                            break
-                    trace_return = ' ' * indent + f"_trace_return('{func_name}')"
-                    instrumented_lines.append(trace_return)
-                
-                # 缩进级别与原始代码行相同
-                indent = len(line) - len(line.lstrip())
-                trace_call = ' ' * indent + f"_trace_line({i+1}, locals())"
-                instrumented_lines.append(trace_call)
-        
-        # 添加最终跟踪数据输出
-        instrumented_lines.append("print('TRACE_END')")
-        
-        return '\n'.join(instrumented_lines)
+        response.content_type = "application/json"
+        return response
 
-def parse_python_execution_trace(output):
-    """解析Python执行跟踪输出"""
-    trace_lines = [line for line in output.split('\n') if line.startswith('TRACE:')]
-    execution_trace = []
-    
-    for line in trace_lines:
-        try:
-            # 提取JSON部分
-            json_str = line[len('TRACE:'):]
-            trace_data = json.loads(json_str)
-            
-            # 增强跟踪数据
-            if 'line' in trace_data:
-                # 确保变量字段存在
-                if 'variables' not in trace_data:
-                    trace_data['variables'] = {}
-                
-                # 确保调用栈字段存在
-                if 'call_stack' not in trace_data:
-                    trace_data['call_stack'] = []
-                
-                # 添加内存信息
-                trace_data['memory'] = {
-                    'stack': [],
-                    'heap': []
+    @app.errorhandler(Exception)
+    def handle_unexpected_error(error: Exception):
+        LOGGER.exception("Unhandled application error", exc_info=error)
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "error": {
+                        "code": "internal_error",
+                        "message": "Internal server error",
+                    },
                 }
-                
-                # 处理变量，区分栈和堆
-                for var_name, var_value in trace_data['variables'].items():
-                    # 简单判断是否为基本类型
-                    is_primitive = True
-                    if var_value.startswith('list(') or var_value.startswith('dict(') or \
-                       var_value.startswith('tuple(') or var_value.startswith('set(') or \
-                       'object' in var_value.lower() or 'instance' in var_value.lower():
-                        is_primitive = False
-                    
-                    if is_primitive:
-                        trace_data['memory']['stack'].append({
-                            'name': var_name,
-                            'value': var_value,
-                            'type': 'primitive'
-                        })
-                    else:
-                        # 为引用类型创建一个唯一ID
-                        heap_id = f"id_{len(trace_data['memory']['heap'])}"
-                        
-                        # 在栈中添加引用
-                        trace_data['memory']['stack'].append({
-                            'name': var_name,
-                            'value': heap_id,
-                            'type': 'reference'
-                        })
-                        
-                        # 在堆中添加实际对象
-                        trace_data['memory']['heap'].append({
-                            'id': heap_id,
-                            'value': var_value
-                        })
-            
-            execution_trace.append(trace_data)
-        except json.JSONDecodeError as e:
-            print(f"JSON解析错误: {e}")
-            continue
-    
-    return execution_trace
+            ),
+            500,
+        )
 
-def analyze_python_structure(code):
-    """分析Python代码结构，使用AST模块识别函数、类、循环等"""
-    import ast
-    
+
+def register_routes(app: Flask) -> None:
+    @app.get("/")
+    @app.get("/api")
+    def index():
+        return jsonify(
+            {
+                "status": "ok",
+                "service": "code-visualizer-api",
+                "version": 2,
+                "supported_languages": sorted(SUPPORTED_LANGUAGES),
+            }
+        )
+
+    @app.get("/health")
+    @app.get("/api/health")
+    def health():
+        compiler_name = app.config["C_COMPILER"]
+        compiler_path = shutil.which(compiler_name)
+        if compiler_path:
+            compiler_path = str(Path(compiler_path).resolve())
+        return jsonify(
+            {
+                "status": "ok",
+                "environment": app.config["APP_ENV"],
+                "python_version": sys.version.split()[0],
+                "execution_enabled": app.config["ALLOW_CODE_EXECUTION"],
+                "limits": {
+                    "timeout_seconds": app.config["EXECUTION_TIMEOUT_SECONDS"],
+                    "trace_steps": app.config["MAX_TRACE_STEPS"],
+                    "memory_mb": app.config["MAX_MEMORY_MB"],
+                    "output_bytes": app.config["MAX_OUTPUT_BYTES"],
+                    "resource_limits_supported": os.name == "posix",
+                },
+                "compiler": {
+                    "configured": compiler_name,
+                    "available": bool(compiler_path),
+                    "path": compiler_path,
+                },
+            }
+        )
+
+    @app.post("/analyze")
+    @app.post("/api/analyze")
+    def analyze():
+        payload = request.get_json(silent=True)
+        if payload is None:
+            raise ApiError(
+                "Request body must be valid JSON.",
+                code="invalid_json",
+            )
+        if not isinstance(payload, dict):
+            raise ApiError("Request body must be a JSON object.", code="invalid_body")
+
+        code = payload.get("code", "")
+        language = payload.get("language", "python")
+        debug = payload.get("debug", False)
+
+        if not isinstance(code, str) or not code.strip():
+            raise ApiError("Code is required.", code="code_required")
+        if not isinstance(language, str):
+            raise ApiError("Language must be a string.", code="invalid_language")
+        language = language.strip().lower()
+        if type(debug) is not bool:
+            raise ApiError("Debug must be a boolean.", code="invalid_debug")
+
+        if language not in SUPPORTED_LANGUAGES:
+            raise ApiError(
+                "Unsupported language.",
+                code="unsupported_language",
+                details={"supported_languages": sorted(SUPPORTED_LANGUAGES)},
+            )
+
+        if len(code) > app.config["MAX_CODE_LENGTH"]:
+            raise ApiError(
+                "Code exceeds the maximum allowed size.",
+                code="code_too_large",
+                details={"max_code_length": app.config["MAX_CODE_LENGTH"]},
+            )
+        breakpoints = normalize_breakpoints(
+            payload.get("breakpoints", []), code.count("\n") + 1
+        )
+
+        analysis = analyze_code(
+            code=code,
+            language=language,
+            debug=debug,
+            breakpoints=breakpoints,
+            config=app.config,
+        )
+        return jsonify(analysis)
+
+
+def normalize_breakpoints(raw_breakpoints: Any, line_count: int) -> list[int]:
+    if raw_breakpoints in (None, ""):
+        return []
+    if not isinstance(raw_breakpoints, list):
+        raise ApiError(
+            "Breakpoints must be an array of line numbers.",
+            code="invalid_breakpoints",
+        )
+
+    cleaned: set[int] = set()
+    for item in raw_breakpoints:
+        if type(item) is not int or not 1 <= item <= line_count:
+            raise ApiError(
+                "Breakpoints must be integer line numbers within the snippet.",
+                code="invalid_breakpoints",
+            )
+        cleaned.add(item)
+
+    return sorted(cleaned)
+
+
+def analyze_code(
+    *,
+    code: str,
+    language: str,
+    debug: bool,
+    breakpoints: list[int],
+    config: Any,
+) -> dict[str, Any]:
+    if language == "python":
+        return analyze_python_code(
+            code=code,
+            debug=debug,
+            breakpoints=breakpoints,
+            timeout_seconds=config["EXECUTION_TIMEOUT_SECONDS"],
+            max_trace_steps=config["MAX_TRACE_STEPS"],
+            max_memory_mb=config["MAX_MEMORY_MB"],
+            max_output_bytes=config["MAX_OUTPUT_BYTES"],
+            execution_enabled=config["ALLOW_CODE_EXECUTION"],
+        )
+    return analyze_c_code(
+        code=code,
+        breakpoints=breakpoints,
+        compiler_name=config["C_COMPILER"],
+        timeout_seconds=config["EXECUTION_TIMEOUT_SECONDS"],
+        max_memory_mb=config["MAX_MEMORY_MB"],
+        max_output_bytes=config["MAX_OUTPUT_BYTES"],
+        execution_enabled=config["ALLOW_CODE_EXECUTION"],
+    )
+
+
+def analyze_python_code(
+    *,
+    code: str,
+    debug: bool,
+    breakpoints: list[int],
+    timeout_seconds: float,
+    max_trace_steps: int,
+    max_memory_mb: int,
+    max_output_bytes: int,
+    execution_enabled: bool,
+) -> dict[str, Any]:
+    try:
+        code_structure = analyze_python_structure(code)
+    except SyntaxError as error:
+        return build_validation_error_response(
+            language="python",
+            error=error,
+            code=code,
+            execution_enabled=execution_enabled,
+        )
+
+    if not execution_enabled:
+        response = build_base_response(
+            language="python",
+            code=code,
+            code_structure=code_structure,
+            execution_trace=[],
+            stdout="",
+            stderr="",
+            status="success",
+            error_message=None,
+            note="Code execution is disabled. Returned static analysis only.",
+            supports_execution_trace=False,
+            breakpoints=breakpoints,
+        )
+        response["metadata"]["execution_enabled"] = False
+        return response
+
+    with tempfile.TemporaryDirectory(prefix="code-visualizer-python-") as temp_dir:
+        code_path = Path(temp_dir) / "snippet.py"
+        bootstrap_path = Path(temp_dir) / "bootstrap.py"
+        code_path.write_text(code, encoding="utf-8")
+        bootstrap_path.write_text(PYTHON_TRACE_BOOTSTRAP, encoding="utf-8")
+
+        process = run_process(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-u",
+                str(bootstrap_path),
+                str(code_path),
+                str(max_trace_steps),
+            ],
+            cwd=temp_dir,
+            timeout_seconds=timeout_seconds,
+            max_memory_mb=max_memory_mb,
+            max_output_bytes=max_output_bytes,
+            max_stderr_bytes=4 * 1024 * 1024,
+        )
+
+    trace_entries, stderr, trace_limit_reached, final_variables = extract_trace_entries(
+        process.stderr
+    )
+    execution_trace = enrich_execution_trace(trace_entries)
+    summary = build_execution_summary(execution_trace, code, final_variables)
+    breakpoint_hits = find_breakpoint_hits(execution_trace, breakpoints)
+    output_limit_reached = process.output_limit_reached or len(stderr.encode("utf-8")) > max_output_bytes
+    error_message = process_error(process, "Python execution", stderr)
+    if output_limit_reached:
+        error_message = "Python execution exceeded the output limit."
+    status = (
+        "error" if process.timed_out or output_limit_reached
+        else "runtime_error" if process.returncode
+        else "success"
+    )
+    if process.timed_out:
+        note = "Execution stopped at the time limit. Partial output and trace are shown."
+    elif output_limit_reached:
+        note = "Output reached the configured limit. Captured output is truncated."
+    elif trace_limit_reached:
+        note = f"Trace limited to {max_trace_steps} steps. Final values reflect the completed program."
+    else:
+        note = "Trace snapshots record values before each line. Breakpoints navigate this recorded run."
+
+    response = build_base_response(
+        language="python",
+        code=code,
+        code_structure=code_structure,
+        execution_trace=execution_trace,
+        stdout=process.stdout,
+        stderr=bounded_text(stderr, max_output_bytes),
+        status=status,
+        error_message=error_message,
+        note=note,
+        supports_execution_trace=True,
+        breakpoints=breakpoints,
+        summary=summary,
+    )
+    response["breakpoint_hits"] = breakpoint_hits
+    response["paused_at"] = resolve_paused_at(debug, breakpoint_hits, execution_trace)
+    response["metadata"]["trace_limit_reached"] = trace_limit_reached
+    response["metadata"]["output_limit_reached"] = output_limit_reached
+    response["metadata"]["timed_out"] = process.timed_out
+    response["metadata"]["execution_enabled"] = True
+    response["metadata"]["final_variables_available"] = final_variables is not None
+    return response
+
+
+def analyze_c_code(
+    *,
+    code: str,
+    breakpoints: list[int],
+    compiler_name: str,
+    timeout_seconds: float,
+    max_memory_mb: int,
+    max_output_bytes: int,
+    execution_enabled: bool,
+) -> dict[str, Any]:
+    code_structure = analyze_c_structure(code)
+    compiler_path = shutil.which(compiler_name)
+    if compiler_path:
+        compiler_path = str(Path(compiler_path).resolve())
+    compiler = {
+        "configured": compiler_name,
+        "available": bool(compiler_path),
+        "path": compiler_path,
+    }
+
+    def respond(
+        process: ProcessResult | None = None,
+        *,
+        status: str = "success",
+        error: str | None = None,
+        note: str = "C analysis includes structure, validation, and program output; no execution trace.",
+        diagnostics: str = "",
+    ) -> dict[str, Any]:
+        response = build_base_response(
+            language="c",
+            code=code,
+            code_structure=code_structure,
+            execution_trace=[],
+            stdout=process.stdout if process else "",
+            stderr=bounded_text(
+                "\n".join(part for part in (diagnostics, process.stderr if process else "") if part),
+                max_output_bytes,
+            ),
+            status=status,
+            error_message=error,
+            note=note,
+            supports_execution_trace=False,
+            breakpoints=breakpoints,
+            compiler=compiler,
+        )
+        response["metadata"].update(
+            execution_enabled=execution_enabled,
+            output_limit_reached=bool(process and process.output_limit_reached),
+            timed_out=bool(process and process.timed_out),
+        )
+        return response
+
+    if not execution_enabled:
+        return respond(note="Code execution is disabled. Returned static analysis only.")
+    if compiler_path is None:
+        return respond(note="C compiler is not available. Returned static analysis only.")
+
+    with tempfile.TemporaryDirectory(prefix="code-visualizer-c-") as temp_dir:
+        source_path = Path(temp_dir) / "snippet.c"
+        binary_path = Path(temp_dir) / "snippet.out"
+        source_path.write_text(code, encoding="utf-8")
+
+        def execute(command: list[str]) -> ProcessResult:
+            return run_process(
+                command,
+                cwd=temp_dir,
+                timeout_seconds=timeout_seconds,
+                max_memory_mb=max_memory_mb,
+                max_output_bytes=max_output_bytes,
+            )
+
+        syntax_result = execute([compiler_path, "-fsyntax-only", str(source_path)])
+        error = process_error(syntax_result, "C syntax validation")
+        if error:
+            return respond(
+                syntax_result,
+                status="error" if syntax_result.timed_out or syntax_result.output_limit_reached else "validation_error",
+                error=error,
+                note="Returned static analysis because C syntax validation did not complete successfully.",
+            )
+
+        compile_result = execute(
+            [compiler_path, str(source_path), "-O0", "-g", "-o", str(binary_path)]
+        )
+        error = process_error(compile_result, "C compilation")
+        if error:
+            return respond(
+                compile_result,
+                status="error",
+                error=error,
+                note="The source passed syntax validation but did not build successfully.",
+            )
+
+        run_result = execute([str(binary_path)])
+
+    error = process_error(run_result, "C execution")
+    return respond(
+        run_result,
+        status=(
+            "error" if run_result.timed_out or run_result.output_limit_reached
+            else "runtime_error" if run_result.returncode
+            else "success"
+        ),
+        error=error,
+        diagnostics=compile_result.stderr,
+    )
+
+
+def bounded_text(value: str, max_bytes: int) -> str:
+    return value.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def process_error(process: ProcessResult, label: str, stderr: str | None = None) -> str | None:
+    if process.timed_out:
+        return f"{label} timed out."
+    if process.output_limit_reached:
+        return f"{label} exceeded the output limit."
+    if process.returncode:
+        return extract_runtime_error(process.stderr if stderr is None else stderr) or (
+            f"{label} exited with status {process.returncode}."
+        )
+    return None
+
+
+def build_validation_error_response(
+    language: str, error: SyntaxError, code: str, execution_enabled: bool
+) -> dict[str, Any]:
+    location = {
+        "line": error.lineno,
+        "column": error.offset,
+    }
+    return {
+        "status": "validation_error",
+        "language": language,
+        "execution_trace": [],
+        "code_structure": empty_structure_for_language(language),
+        "stdout": "",
+        "stderr": error.text.strip() if error.text else "",
+        "error": error.msg,
+        "note": "Source parsing failed before execution.",
+        "paused_at": None,
+        "breakpoint_hits": [],
+        "summary": build_execution_summary([], code),
+        "metadata": {
+            "location": location,
+            "supports_execution_trace": language == "python" and execution_enabled,
+            "execution_enabled": execution_enabled,
+            "breakpoints": [],
+            "code_metrics": {"lines": len(code.splitlines()), "characters": len(code)},
+        },
+    }
+
+
+def build_base_response(
+    *,
+    language: str,
+    code: str,
+    code_structure: dict[str, Any],
+    execution_trace: list[dict[str, Any]],
+    stdout: str,
+    stderr: str,
+    status: str,
+    error_message: str | None,
+    note: str | None,
+    supports_execution_trace: bool,
+    breakpoints: list[int],
+    summary: dict[str, Any] | None = None,
+    compiler: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    response = {
+        "status": status,
+        "language": language,
+        "execution_trace": execution_trace,
+        "code_structure": code_structure,
+        "stdout": stdout,
+        "stderr": stderr,
+        "error": error_message,
+        "note": note,
+        "paused_at": None,
+        "breakpoint_hits": [],
+        "summary": summary or build_execution_summary(execution_trace, code),
+        "metadata": {
+            "supports_execution_trace": supports_execution_trace,
+            "breakpoints": breakpoints,
+            "code_metrics": {
+                "lines": len(code.splitlines()),
+                "characters": len(code),
+            },
+        },
+    }
+    if compiler is not None:
+        response["metadata"]["compiler"] = compiler
+    return response
+
+
+def empty_structure_for_language(language: str) -> dict[str, Any]:
+    if language == "c":
+        return {
+            "functions": [],
+            "structs": [],
+            "variables": [],
+            "loops": [],
+            "conditionals": [],
+        }
+    return {
+        "functions": [],
+        "classes": [],
+        "loops": [],
+        "conditionals": [],
+    }
+
+
+def extract_trace_entries(
+    stderr: str,
+) -> tuple[list[dict[str, Any]], str, bool, dict[str, str] | None]:
+    trace_entries: list[dict[str, Any]] = []
+    clean_stderr: list[str] = []
+    trace_limit_reached = False
+    final_variables = None
+
+    for raw_line in stderr.splitlines():
+        if not raw_line.startswith(TRACE_PREFIX):
+            clean_stderr.append(raw_line)
+            continue
+
+        payload = raw_line[len(TRACE_PREFIX) :]
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            clean_stderr.append(raw_line)
+            continue
+        if not isinstance(parsed, dict):
+            clean_stderr.append(raw_line)
+            continue
+
+        if parsed.get("event") == "trace_limit_reached":
+            trace_limit_reached = True
+            continue
+        variables = parsed.get("variables")
+        if not isinstance(variables, dict) or not all(
+            isinstance(name, str) and isinstance(value, str)
+            for name, value in variables.items()
+        ):
+            clean_stderr.append(raw_line)
+            continue
+        if parsed.get("event") == "final_state":
+            final_variables = variables
+            continue
+        if type(parsed.get("line")) is not int or parsed["line"] < 1:
+            clean_stderr.append(raw_line)
+            continue
+
+        trace_entries.append(parsed)
+
+    return trace_entries, "\n".join(clean_stderr).strip(), trace_limit_reached, final_variables
+
+
+def enrich_execution_trace(trace_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    enriched: list[dict[str, Any]] = []
+    for entry in trace_entries:
+        variables = entry.get("variables", {})
+        memory = build_memory_view(variables)
+        enriched.append(
+            {
+                "line": entry.get("line"),
+                "function": entry.get("function"),
+                "variables": variables,
+                "call_stack": entry.get("call_stack", []),
+                "memory": memory,
+            }
+        )
+    return enriched
+
+
+def build_memory_view(variables: dict[str, str]) -> dict[str, list[dict[str, str]]]:
+    stack: list[dict[str, str]] = []
+    heap: list[dict[str, str]] = []
+
+    for name, value in variables.items():
+        if is_primitive_value(value):
+            stack.append({"name": name, "value": value, "type": "primitive"})
+            continue
+
+        heap_id = f"heap_{len(heap) + 1}"
+        stack.append({"name": name, "value": heap_id, "type": "reference"})
+        heap.append({"id": heap_id, "value": value})
+
+    return {"stack": stack, "heap": heap}
+
+
+def is_primitive_value(value: str | None) -> bool:
+    if value is None:
+        return True
+
+    stripped = value.strip()
+    numeric = re.fullmatch(r"-?\d+(\.\d+)?", stripped)
+    quoted = re.fullmatch(r"(['\"]).*\1", stripped)
+    boolean = stripped in {"True", "False", "None", "true", "false", "null"}
+    return bool(numeric or quoted or boolean)
+
+
+def find_breakpoint_hits(
+    execution_trace: list[dict[str, Any]],
+    breakpoints: list[int],
+) -> list[int]:
+    if not breakpoints:
+        return []
+
+    breakpoint_set = set(breakpoints)
+    return [
+        index
+        for index, step in enumerate(execution_trace)
+        if step.get("line") in breakpoint_set
+    ]
+
+
+def resolve_paused_at(
+    debug: bool,
+    breakpoint_hits: list[int],
+    execution_trace: list[dict[str, Any]],
+) -> int | None:
+    if not execution_trace:
+        return None
+    if not debug:
+        return 0
+    if breakpoint_hits:
+        return breakpoint_hits[0]
+    return 0
+
+
+def extract_runtime_error(stderr: str) -> str | None:
+    if not stderr:
+        return None
+
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    return lines[-1] if lines else None
+
+
+def build_execution_summary(
+    execution_trace: list[dict[str, Any]],
+    code: str,
+    final_variables: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    unique_lines = sorted(
+        {step["line"] for step in execution_trace if isinstance(step.get("line"), int)}
+    )
+    return {
+        "step_count": len(execution_trace),
+        "executed_lines": unique_lines,
+        "executed_line_count": len(unique_lines),
+        "final_variables": (
+            final_variables if final_variables is not None
+            else execution_trace[-1]["variables"] if execution_trace
+            else {}
+        ),
+        "code_line_count": len(code.splitlines()) if code else 0,
+    }
+
+
+def analyze_python_structure(code: str) -> dict[str, Any]:
+    tree = ast.parse(code)
     structure = {
         "functions": [],
         "classes": [],
         "loops": [],
-        "conditionals": []
+        "conditionals": [],
     }
-    
-    try:
-        # 解析代码为AST
-        tree = ast.parse(code)
-        
-        # 定义AST访问器来收集代码结构信息
-        class StructureVisitor(ast.NodeVisitor):
-            def __init__(self):
-                self.functions = []
-                self.classes = []
-                self.loops = []
-                self.conditionals = []
-                self.current_line = 0
-            
-            def visit_FunctionDef(self, node):
-                self.functions.append({
+
+    class StructureVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            arguments = [*node.args.posonlyargs, *node.args.args]
+            if node.args.vararg:
+                arguments.append(node.args.vararg)
+            arguments.extend(node.args.kwonlyargs)
+            if node.args.kwarg:
+                arguments.append(node.args.kwarg)
+            structure["functions"].append(
+                {
                     "name": node.name,
                     "line": node.lineno,
-                    "args": [arg.arg for arg in node.args.args]
-                })
-                self.generic_visit(node)
-            
-            def visit_ClassDef(self, node):
-                self.classes.append({
+                    "end_line": node.end_lineno,
+                    "args": [argument.arg for argument in arguments],
+                    "async": isinstance(node, ast.AsyncFunctionDef),
+                }
+            )
+            self.generic_visit(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self.visit_FunctionDef(node)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            structure["classes"].append(
+                {
                     "name": node.name,
                     "line": node.lineno,
-                    "bases": [base.id if isinstance(base, ast.Name) else "..." for base in node.bases]
-                })
-                self.generic_visit(node)
-            
-            def visit_For(self, node):
-                self.loops.append({
-                    "type": "for",
-                    "line": node.lineno,
-                    "target": ast.unparse(node.target) if hasattr(ast, 'unparse') else "..."
-                })
-                self.generic_visit(node)
-            
-            def visit_While(self, node):
-                self.loops.append({
-                    "type": "while",
-                    "line": node.lineno
-                })
-                self.generic_visit(node)
-            
-            def visit_If(self, node):
-                self.conditionals.append({
-                    "type": "if",
-                    "line": node.lineno
-                })
-                # 递归访问子节点，包括else分支
-                self.generic_visit(node)
-        
-        # 执行访问器
-        visitor = StructureVisitor()
-        visitor.visit(tree)
-        
-        # 将收集到的信息添加到结构中
-        structure["functions"] = visitor.functions
-        structure["classes"] = visitor.classes
-        structure["loops"] = visitor.loops
-        structure["conditionals"] = visitor.conditionals
-        
-    except SyntaxError as e:
-        # 如果代码有语法错误，回退到简单的行分析
-        lines = code.split('\n')
-        for i, line in enumerate(lines):
-            line_stripped = line.strip()
-            if line_stripped.startswith('def '):
-                function_name = line_stripped[4:].split('(')[0]
-                structure["functions"].append({
-                    "name": function_name,
-                    "line": i+1
-                })
-            elif line_stripped.startswith('class '):
-                class_name = line_stripped[6:].split('(')[0].split(':')[0]
-                structure["classes"].append({
-                    "name": class_name,
-                    "line": i+1
-                })
-            elif line_stripped.startswith('for ') or line_stripped.startswith('while '):
-                structure["loops"].append({
-                    "type": "for" if line_stripped.startswith('for ') else "while",
-                    "line": i+1
-                })
-            elif line_stripped.startswith('if ') or line_stripped.startswith('elif ') or line_stripped.startswith('else:'):
-                structure["conditionals"].append({
-                    "type": "if" if line_stripped.startswith('if ') else "elif" if line_stripped.startswith('elif ') else "else",
-                    "line": i+1
-                })
-    
+                    "end_line": node.end_lineno,
+                    "bases": [ast.unparse(base) for base in node.bases],
+                }
+            )
+            self.generic_visit(node)
+
+        def visit_For(self, node: ast.For) -> None:
+            structure["loops"].append(
+                {"type": "for", "line": node.lineno, "end_line": node.end_lineno}
+            )
+            self.generic_visit(node)
+
+        def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+            structure["loops"].append(
+                {"type": "async_for", "line": node.lineno, "end_line": node.end_lineno}
+            )
+            self.generic_visit(node)
+
+        def visit_While(self, node: ast.While) -> None:
+            structure["loops"].append(
+                {"type": "while", "line": node.lineno, "end_line": node.end_lineno}
+            )
+            self.generic_visit(node)
+
+        def visit_If(self, node: ast.If) -> None:
+            structure["conditionals"].append(
+                {"type": "if", "line": node.lineno, "end_line": node.end_lineno}
+            )
+            self.generic_visit(node)
+
+        def visit_Match(self, node: ast.Match) -> None:
+            structure["conditionals"].append(
+                {"type": "match", "line": node.lineno, "end_line": node.end_lineno}
+            )
+            self.generic_visit(node)
+
+    StructureVisitor().visit(tree)
     return structure
 
-def analyze_c_code(code):
-    # 创建临时文件来存储C代码
-    with tempfile.NamedTemporaryFile(suffix='.c', delete=False) as temp_file:
-        temp_file.write(code.encode('utf-8'))
-        temp_file_path = temp_file.name
-    
-    try:
-        # 使用静态分析来获取代码结构
-        code_structure = analyze_c_structure(code)
-        
-        # 创建一个修改版本的代码，添加跟踪语句
-        instrumented_code = instrument_c_code(code)
-        with tempfile.NamedTemporaryFile(suffix='.c', delete=False) as instrumented_file:
-            instrumented_file.write(instrumented_code.encode('utf-8'))
-            instrumented_file_path = instrumented_file.name
-        
-        # 编译原始C代码（检查语法错误）
-        compile_result = subprocess.run(
-            ['gcc', '-fsyntax-only', temp_file_path],
-            capture_output=True,
-            text=True
-        )
-        
-        if compile_result.returncode != 0:
-            return {
-                "status": "error",
-                "error": "Compilation error",
-                "stderr": compile_result.stderr
-            }
-        
-        # 编译插桩后的代码
-        try:
-            executable_path = temp_file_path + '.exe'
-            compile_instrumented = subprocess.run(
-                ['gcc', instrumented_file_path, '-o', executable_path],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            
-            if compile_instrumented.returncode != 0:
-                # 如果插桩代码编译失败，返回原始代码结构
-                return {
-                    "status": "success",
-                    "code_structure": code_structure,
-                    "note": "Instrumented code compilation failed, showing static analysis only",
-                    "stderr": compile_instrumented.stderr
-                }
-            
-            # 运行编译后的程序
-            execution_result = subprocess.run(
-                [executable_path],
-                capture_output=True,
-                text=True,
-                timeout=5  # 设置超时，防止无限循环
-            )
-            
-            # 解析输出以获取执行跟踪
-            execution_trace = parse_c_execution_trace(execution_result.stdout)
-            
-            return {
-                "status": "success",
-                "execution_trace": execution_trace,
-                "code_structure": code_structure,
-                "stdout": execution_result.stdout,
-                "stderr": execution_result.stderr
-            }
-            
-        except subprocess.TimeoutExpired:
-            return {
-                "status": "error", 
-                "error": "Code execution timed out",
-                "code_structure": code_structure
-            }
-        except Exception as e:
-            # 如果执行失败，至少返回静态分析结果
-            return {
-                "status": "partial_success",
-                "error": f"Execution failed: {str(e)}",
-                "code_structure": code_structure
-            }
-        
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-    finally:
-        # 清理临时文件
-        try:
-            os.unlink(temp_file_path)
-            if 'instrumented_file_path' in locals():
-                os.unlink(instrumented_file_path)
-            if 'executable_path' in locals() and os.path.exists(executable_path):
-                os.unlink(executable_path)
-        except:
-            pass
 
-def analyze_c_structure(code):
-    """分析C代码结构，识别函数、结构体、循环和条件语句等"""
+def analyze_c_structure(code: str) -> dict[str, Any]:
     structure = {
         "functions": [],
         "structs": [],
         "variables": [],
         "loops": [],
-        "conditionals": []
+        "conditionals": [],
     }
-    
-    lines = code.split('\n')
-    # 跟踪大括号以确定代码块
-    brace_stack = []
-    current_function = None
-    in_struct = False
-    
-    for i, line in enumerate(lines):
-        line_stripped = line.strip()
-        
-        # 跟踪大括号
-        open_braces = line_stripped.count('{')
-        close_braces = line_stripped.count('}')
-        
-        for _ in range(open_braces):
-            brace_stack.append(i)
-        
-        for _ in range(close_braces):
-            if brace_stack:
-                brace_stack.pop()
-        
-        # 识别函数定义
-        if ')' in line_stripped and '{' in line_stripped and not line_stripped.startswith('#'):
-            # 可能是函数定义
-            parts = line_stripped.split(')')
-            if parts and '(' in parts[0]:
-                func_parts = parts[0].split('(')
-                if len(func_parts) > 0:
-                    # 提取返回类型和函数名
-                    func_decl = func_parts[0].split()
-                    if len(func_decl) > 0:
-                        func_name = func_decl[-1]
-                        return_type = ' '.join(func_decl[:-1]) if len(func_decl) > 1 else 'int'
-                        
-                        # 提取参数
-                        params = []
-                        if len(func_parts) > 1 and '(' in line_stripped:
-                            param_str = line_stripped.split('(')[1].split(')')[0]
-                            if param_str.strip() and param_str.strip() != 'void':
-                                params = [p.strip() for p in param_str.split(',')]
-                        
-                        function_info = {
-                            "name": func_name,
-                            "line": i+1,
-                            "return_type": return_type,
-                            "params": params
-                        }
-                        structure["functions"].append(function_info)
-                        current_function = func_name
-        
-        # 识别结构体定义
-        if line_stripped.startswith('struct ') and '{' in line_stripped:
-            struct_name = line_stripped[7:].split('{')[0].strip()
-            structure["structs"].append({
-                "name": struct_name,
-                "line": i+1
-            })
-            in_struct = True
-        
-        # 结构体结束
-        if in_struct and '}' in line_stripped and ';' in line_stripped:
-            in_struct = False
-        
-        # 识别全局变量和局部变量
-        if ';' in line_stripped and '=' in line_stripped and not line_stripped.startswith('#') and '{' not in line_stripped:
-            var_parts = line_stripped.split('=')[0].strip().split()
-            if len(var_parts) > 1:
-                var_name = var_parts[-1].replace('*', '').strip()
-                var_type = ' '.join(var_parts[:-1])
-                
-                var_info = {
-                    "name": var_name,
-                    "type": var_type,
-                    "line": i+1,
-                    "scope": "global" if not current_function else "local"
+
+    brace_depth = 0
+    active_function: str | None = None
+
+    for index, raw_line in enumerate(code.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+            brace_depth += raw_line.count("{") - raw_line.count("}")
+            if brace_depth <= 0:
+                active_function = None
+                brace_depth = max(brace_depth, 0)
+            continue
+
+        struct_match = STRUCT_PATTERN.match(raw_line)
+        if struct_match:
+            structure["structs"].append(
+                {"name": struct_match.group(1), "line": index}
+            )
+
+        function_match = FUNCTION_PATTERN.match(raw_line)
+        if function_match:
+            params = [
+                param.strip()
+                for param in function_match.group(3).split(",")
+                if param.strip() and param.strip() != "void"
+            ]
+            active_function = function_match.group(2)
+            structure["functions"].append(
+                {
+                    "name": function_match.group(2),
+                    "line": index,
+                    "return_type": function_match.group(1).strip(),
+                    "params": params,
                 }
-                structure["variables"].append(var_info)
-        
-        # 识别循环语句
-        if line_stripped.startswith('for ') or line_stripped.startswith('while '):
-            loop_type = "for" if line_stripped.startswith('for ') else "while"
-            structure["loops"].append({
-                "type": loop_type,
-                "line": i+1
-            })
-        
-        # 识别条件语句
-        if line_stripped.startswith('if ') or line_stripped.startswith('else if ') or line_stripped.startswith('else '):
-            cond_type = "if" if line_stripped.startswith('if ') else "else if" if line_stripped.startswith('else if ') else "else"
-            structure["conditionals"].append({
-                "type": cond_type,
-                "line": i+1
-            })
-    
+            )
+
+        variable_match = VARIABLE_PATTERN.match(raw_line)
+        if variable_match:
+            structure["variables"].append(
+                {
+                    "name": variable_match.group(2),
+                    "type": variable_match.group(1).strip(),
+                    "line": index,
+                    "scope": "local" if active_function else "global",
+                }
+            )
+
+        if stripped.startswith("for ") or stripped.startswith("for("):
+            structure["loops"].append({"type": "for", "line": index})
+        if stripped.startswith("while ") or stripped.startswith("while("):
+            structure["loops"].append({"type": "while", "line": index})
+        if stripped.startswith("if ") or stripped.startswith("if("):
+            structure["conditionals"].append({"type": "if", "line": index})
+        if stripped.startswith("else if ") or stripped.startswith("else if("):
+            structure["conditionals"].append({"type": "else_if", "line": index})
+        if stripped == "else" or stripped.startswith("else {"):
+            structure["conditionals"].append({"type": "else", "line": index})
+
+        brace_depth += raw_line.count("{") - raw_line.count("}")
+        if brace_depth <= 0:
+            active_function = None
+            brace_depth = 0
+
     return structure
 
-def instrument_c_code(code):
-    """向C代码添加跟踪语句，以便跟踪变量和执行流程"""
-    # 添加必要的头文件和跟踪函数
-    trace_header = """
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-// 跟踪函数
-void _trace_line(int line_no, const char* func_name) {
-    printf("TRACE:{\"line\":%d,\"function\":\"%s\",\"variables\":{}}", line_no, func_name);
-    fflush(stdout);
-}
+app = create_app()
 
-// 变量跟踪函数
-void _trace_int(int line_no, const char* func_name, const char* var_name, int value) {
-    printf("TRACE:{\"line\":%d,\"function\":\"%s\",\"variables\":{\"%s\":\"%d\"}}", 
-           line_no, func_name, var_name, value);
-    fflush(stdout);
-}
 
-void _trace_double(int line_no, const char* func_name, const char* var_name, double value) {
-    printf("TRACE:{\"line\":%d,\"function\":\"%s\",\"variables\":{\"%s\":\"%f\"}}", 
-           line_no, func_name, var_name, value);
-    fflush(stdout);
-}
-
-void _trace_char(int line_no, const char* func_name, const char* var_name, char value) {
-    printf("TRACE:{\"line\":%d,\"function\":\"%s\",\"variables\":{\"%s\":\"%c\"}}", 
-           line_no, func_name, var_name, value);
-    fflush(stdout);
-}
-
-void _trace_string(int line_no, const char* func_name, const char* var_name, const char* value) {
-    printf("TRACE:{\"line\":%d,\"function\":\"%s\",\"variables\":{\"%s\":\"%s\"}}", 
-           line_no, func_name, var_name, value ? value : "NULL");
-    fflush(stdout);
-}
-
-void _trace_pointer(int line_no, const char* func_name, const char* var_name, const void* value) {
-    printf("TRACE:{\"line\":%d,\"function\":\"%s\",\"variables\":{\"%s\":\"pointer(%p)\"}}", 
-           line_no, func_name, var_name, value);
-    fflush(stdout);
-}
-
-// 函数调用跟踪
-void _trace_call(int line_no, const char* func_name) {
-    printf("TRACE:{\"line\":%d,\"event\":\"call\",\"function\":\"%s\"}", 
-           line_no, func_name);
-    fflush(stdout);
-}
-
-// 函数返回跟踪
-void _trace_return(int line_no, const char* func_name) {
-    printf("TRACE:{\"line\":%d,\"event\":\"return\",\"function\":\"%s\"}", 
-           line_no, func_name);
-    fflush(stdout);
-}
-"""
-    
-    # 解析代码，找出函数和变量
-    structure = analyze_c_structure(code)
-    
-    # 将代码分割成行
-    lines = code.split('\n')
-    instrumented_lines = []
-    
-    # 添加跟踪头文件
-    instrumented_lines.append(trace_header)
-    
-    # 当前函数名
-    current_function = "global"
-    # 跟踪大括号以确定代码块
-    brace_stack = []
-    # 是否在函数内部
-    in_function = False
-    
-    # 处理每一行代码
-    for i, line in enumerate(lines):
-        line_stripped = line.strip()
-        
-        # 跟踪大括号
-        open_braces = line_stripped.count('{')
-        close_braces = line_stripped.count('}')
-        
-        # 检测函数定义
-        for func in structure["functions"]:
-            if func["line"] == i+1:
-                current_function = func["name"]
-                in_function = True
-                # 在函数开始时添加调用跟踪
-                instrumented_lines.append(line)
-                indent = len(line) - len(line.lstrip())
-                trace_call = ' ' * indent + f"_trace_call({i+1}, \"{current_function}\");"
-                instrumented_lines.append(trace_call)
-                break
-        else:
-            # 如果不是函数定义行，直接添加
-            instrumented_lines.append(line)
-        
-        # 更新大括号栈
-        for _ in range(open_braces):
-            brace_stack.append(i)
-        
-        for _ in range(close_braces):
-            if brace_stack:
-                brace_stack.pop()
-                # 如果大括号栈为空且在函数内，说明函数结束
-                if not brace_stack and in_function and '}' in line_stripped:
-                    indent = len(line) - len(line.lstrip())
-                    trace_return = ' ' * indent + f"_trace_return({i+1}, \"{current_function}\");"
-                    instrumented_lines.append(trace_return)
-                    in_function = False
-                    current_function = "global"
-        
-        # 在每个语句后添加跟踪调用（简化版，只处理分号结尾的行）
-        if ';' in line_stripped and not line_stripped.startswith('#') and in_function:
-            indent = len(line) - len(line.lstrip())
-            trace_line = ' ' * indent + f"_trace_line({i+1}, \"{current_function}\");"
-            instrumented_lines.append(trace_line)
-            
-            # 尝试跟踪变量（简化版，只处理简单赋值）
-            if '=' in line_stripped and not line_stripped.startswith('if') and not line_stripped.startswith('for') and not line_stripped.startswith('while'):
-                var_parts = line_stripped.split('=')[0].strip().split()
-                if len(var_parts) > 1:
-                    var_name = var_parts[-1].replace('*', '').strip()
-                    var_type = ' '.join(var_parts[:-1])
-                    
-                    # 根据变量类型选择跟踪函数
-                    if 'int' in var_type:
-                        trace_var = ' ' * indent + f"_trace_int({i+1}, \"{current_function}\", \"{var_name}\", {var_name});"
-                    elif 'double' in var_type or 'float' in var_type:
-                        trace_var = ' ' * indent + f"_trace_double({i+1}, \"{current_function}\", \"{var_name}\", {var_name});"
-                    elif 'char' in var_type and '*' in var_type:
-                        trace_var = ' ' * indent + f"_trace_string({i+1}, \"{current_function}\", \"{var_name}\", {var_name});"
-                    elif 'char' in var_type:
-                        trace_var = ' ' * indent + f"_trace_char({i+1}, \"{current_function}\", \"{var_name}\", {var_name});"
-                    else:
-                        trace_var = ' ' * indent + f"_trace_pointer({i+1}, \"{current_function}\", \"{var_name}\", (void*){var_name});"
-                    
-                    instrumented_lines.append(trace_var)
-    
-    # 添加最终跟踪数据输出
-    instrumented_lines.append("\nint main_original(int argc, char** argv);");
-    instrumented_lines.append("\n// 包装原始main函数");
-    instrumented_lines.append("int main(int argc, char** argv) {");
-    instrumented_lines.append("    int result = main_original(argc, argv);");
-    instrumented_lines.append("    printf(\"TRACE_END\");\n    return result;");
-    instrumented_lines.append("}");
-    
-    # 将原始main函数重命名为main_original
-    code_with_main = '\n'.join(instrumented_lines)
-    code_with_main = code_with_main.replace("int main(", "int main_original(")
-    code_with_main = code_with_main.replace("void main(", "void main_original(")
-    
-    # 确保只替换第一个main函数
-    main_count = code_with_main.count("main_original")
-    if main_count > 1:
-        # 恢复最后一个替换（我们添加的包装函数）
-        last_main_pos = code_with_main.rfind("main_original")
-        code_with_main = code_with_main[:last_main_pos] + "main" + code_with_main[last_main_pos+13:]
-    
-    return code_with_main
-
-def parse_c_execution_trace(output):
-    """解析C执行跟踪输出"""
-    trace_lines = [line for line in output.split('\n') if line.startswith('TRACE:')]
-    execution_trace = []
-    call_stack = []
-    
-    for line in trace_lines:
-        try:
-            # 提取JSON部分
-            json_str = line[len('TRACE:'):]
-            trace_data = json.loads(json_str)
-            
-            # 处理函数调用和返回事件
-            if 'event' in trace_data:
-                if trace_data['event'] == 'call':
-                    call_stack.append(trace_data['function'])
-                elif trace_data['event'] == 'return' and call_stack:
-                    call_stack.pop()
-            
-            # 添加调用栈信息
-            trace_data['call_stack'] = list(call_stack)
-            
-            # 增强跟踪数据
-            if 'line' in trace_data:
-                # 确保变量字段存在
-                if 'variables' not in trace_data:
-                    trace_data['variables'] = {}
-                
-                # 添加内存信息
-                trace_data['memory'] = {
-                    'stack': [],
-                    'heap': []
-                }
-                
-                # 处理变量，区分栈和堆
-                for var_name, var_value in trace_data['variables'].items():
-                    # 简单判断是否为基本类型
-                    is_primitive = True
-                    if 'pointer' in var_value or 'array' in var_value:
-                        is_primitive = False
-                    
-                    if is_primitive:
-                        trace_data['memory']['stack'].append({
-                            'name': var_name,
-                            'value': var_value,
-                            'type': 'primitive'
-                        })
-                    else:
-                        # 为引用类型创建一个唯一ID
-                        heap_id = f"id_{len(trace_data['memory']['heap'])}"
-                        
-                        # 在栈中添加引用
-                        trace_data['memory']['stack'].append({
-                            'name': var_name,
-                            'value': heap_id,
-                            'type': 'reference'
-                        })
-                        
-                        # 在堆中添加实际对象
-                        trace_data['memory']['heap'].append({
-                            'id': heap_id,
-                            'value': var_value
-                        })
-            
-            execution_trace.append(trace_data)
-        except json.JSONDecodeError as e:
-            print(f"JSON解析错误: {e}")
-            continue
-    
-    return execution_trace
-
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    app.run(
+        debug=app.config["APP_ENV"] == "development",
+        host=app.config["HOST"],
+        port=app.config["PORT"],
+    )
